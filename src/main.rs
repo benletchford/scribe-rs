@@ -447,7 +447,8 @@ async fn transcribe_images(
 
             let result: ChatCompletionResponse = resp.json().await?;
             if let Some(err) = result.error {
-                return Err(anyhow::anyhow!("API Error: {}", err.message));
+                let type_str = err.error_type.as_deref().unwrap_or("unknown");
+                return Err(anyhow::anyhow!("API Error ({}): {}", type_str, err.message));
             }
 
             let mut text = result.choices
