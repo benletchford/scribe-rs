@@ -14,6 +14,7 @@ use tokio::fs;
 use tokio::sync::Semaphore;
 use rayon::prelude::*;
 use walkdir::WalkDir;
+use regex::Regex;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -91,6 +92,16 @@ enum Commands {
         /// Limit number of pages to process
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Combine markdown files into a single book with TOC
+    Combine {
+        /// Input directory containing markdown files
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output file path (default: input_dir/../{book_name}.md)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     }
 }
 
@@ -146,6 +157,128 @@ struct OpenRouterError {
 }
 
 // --- Phases ---
+
+fn combine_book(input_dir: &Path, output_file: &Path) -> Result<()> {
+    println!("Combining markdown files from {:?} into {:?}", input_dir, output_file);
+    
+    let mut files = Vec::new();
+    // Use standard read_dir or WalkDir. max_depth(1) to avoid recursing if subdirs exist
+    for entry in WalkDir::new(input_dir).max_depth(1) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("page_") && name.ends_with(".md") {
+                     // Extract number for sorting: page_0001.md -> 1
+                     // slice from 5 to len-3
+                     let num_part = &name[5..name.len()-3];
+                     if let Ok(num) = num_part.parse::<usize>() {
+                         files.push((num, entry.path().to_path_buf()));
+                     }
+                }
+            }
+        }
+    }
+    
+    // Sort by page number
+    files.sort_by_key(|k| k.0);
+    
+    if files.is_empty() {
+        println!("No page_*.md files found.");
+        return Ok(());
+    }
+
+    // Validate completeness against images directory
+    // Assumption: input_dir is .../markdown, images is .../images
+    if let Some(parent) = input_dir.parent() {
+        let images_dir = parent.join("images");
+        if images_dir.exists() {
+            let mut img_count = 0;
+            for entry in WalkDir::new(&images_dir).max_depth(1) {
+                let entry = entry?;
+                if entry.file_type().is_file() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.starts_with("page_") && name.ends_with(".png") {
+                           img_count += 1;
+                        }
+                    }
+                }
+            }
+            
+            if files.len() != img_count {
+                return Err(anyhow::anyhow!(
+                    "Mismatch: Found {} markdown files but {} images. \
+                    Ensure all pages have been transcribed before combining.",
+                    files.len(), img_count
+                ));
+            }
+            println!("Verified {} pages (matches {} source images)", files.len(), img_count);
+        } else {
+             println!("Warning: Could not find sibling 'images' directory to verify completeness.");
+        }
+    }
+    
+    let mut combined_content = String::new();
+    let mut toc_lines = Vec::new();
+    let mut seen_slugs = std::collections::HashMap::new();
+
+    // Regex to match image links containing 'img/' or just general image links for cleanup
+    // Python script used: r'!\[.*?\]\([^\)]*?img/[^\)]*\)'
+    let img_regex = Regex::new(r"!\[.*?\]\([^\)]*?img/[^\)]*\)")?;
+
+    // Header regex for TOC
+    let header_regex = Regex::new(r"^(#+)\s+(.+)$")?;
+
+    for (page_num, path) in files {
+        // Read synchronously
+        let content = std::fs::read_to_string(&path)?;
+        
+        // Strip images
+        let clean_content = img_regex.replace_all(&content, "");
+        let clean_content = clean_content.trim();
+        
+        combined_content.push_str(&format!("\n<a id='page_{}'></a>\n", page_num));
+        
+        // Scan headers for TOC, processing line by line
+        for line in clean_content.lines() {
+             if let Some(cap) = header_regex.captures(line) {
+                 let level = cap[1].len();
+                 let title = cap[2].trim();
+                 
+                 // Slug generation
+                 let slug_base = title.to_lowercase()
+                    .replace(' ', "-")
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-')
+                    .collect::<String>();
+                 
+                 let slug = if let Some(count) = seen_slugs.get_mut(&slug_base) {
+                     *count += 1;
+                     format!("{}-{}", slug_base, *count)
+                 } else {
+                     seen_slugs.insert(slug_base.clone(), 0);
+                     slug_base
+                 };
+                 
+                 let indent = "  ".repeat(level.saturating_sub(1));
+                 toc_lines.push(format!("{}- [{}]({}) *(Page {})*", indent, title, slug, page_num));
+             }
+        }
+        
+        combined_content.push_str(&clean_content);
+        combined_content.push_str("\n\n---\n\n");
+    }
+    
+    let book_name = output_file.file_stem().unwrap_or_default().to_string_lossy();
+    let mut final_doc = format!("# {}\n\n## Table of Contents\n\n", book_name.replace('_', " "));
+    final_doc.push_str(&toc_lines.join("\n"));
+    final_doc.push_str("\n\n---\n\n");
+    final_doc.push_str(&combined_content);
+    
+    std::fs::write(output_file, final_doc)?;
+    println!("Created combined file: {:?}", output_file);
+    
+    Ok(())
+}
 
 fn extract_pdf(input: &Path, output_dir: &Path, dpi: u16, limit: Option<usize>) -> Result<()> {
     if !output_dir.exists() {
@@ -416,6 +549,19 @@ async fn main() -> Result<()> {
             
             transcribe_images(input, output, concurrency, model, api_key, limit).await?;
         }
+        Commands::Combine { input, output } => {
+             let output = match output {
+                Some(p) => p,
+                None => {
+                     // Default: out/book.md (sibling of markdown dir)
+                     // Input: out/book/markdown -> parent is out/book -> join book.md
+                     let parent = input.parent().unwrap_or(&input);
+                     let book_name = parent.file_name().unwrap_or_default();
+                     parent.join(format!("{}.md", book_name.to_string_lossy()))
+                }
+            };
+            combine_book(&input, &output)?;
+        }
         Commands::Pipeline { input, output, dpi, concurrency, model, limit } => {
              let output_base = match output {
                 Some(p) => p,
@@ -441,7 +587,13 @@ async fn main() -> Result<()> {
             // Transcribe also respects limit, but since we limited extraction, 
             // the images dir will only have 'limit' images anyway. 
             // However, if images already existed, we might want to respect limit on transcription too.
-            transcribe_images(images_dir, markdown_dir, concurrency, model, api_key, limit).await?;
+            transcribe_images(images_dir, markdown_dir.clone(), concurrency, model, api_key, limit).await?;
+            
+            println!("--- Phase 3: Combine ---");
+            let combined_file = output_base.join(format!("{}.md", output_base.file_name().unwrap().to_string_lossy()));
+             if let Err(e) = combine_book(&markdown_dir, &combined_file) {
+                 eprintln!("Warning: Failed to combine files: {}", e);
+             }
         }
     }
 

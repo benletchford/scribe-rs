@@ -2238,6 +2238,7 @@ dependencies = [
  "indicatif",
  "mupdf",
  "rayon",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
