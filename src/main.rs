@@ -12,6 +12,7 @@ use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::sync::Semaphore;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug, Clone)]
@@ -31,13 +32,17 @@ enum Commands {
 
         /// Output directory for images
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// DPI for rasterization
         #[arg(long, default_value_t = 300)]
         dpi: u16,
+
+        /// Limit number of pages to extract
+        #[arg(long)]
+        limit: Option<usize>,
     },
-    /// Transcribe images to Markdown
+    // ... Transcribe stays same ...
     Transcribe {
         /// Input directory containing images
         #[arg(short, long)]
@@ -45,7 +50,7 @@ enum Commands {
 
         /// Output directory for markdown files
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Number of concurrent requests
         #[arg(short, long, default_value_t = 50)]
@@ -68,7 +73,7 @@ enum Commands {
 
         /// Base output directory (will create 'images' and 'markdown' subdirs)
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// DPI for rasterization
         #[arg(long, default_value_t = 300)]
@@ -82,6 +87,10 @@ enum Commands {
         /// Falls back to OPENROUTER_MODEL env var if not specified
         #[arg(long, env = "OPENROUTER_MODEL")]
         model: Option<String>,
+
+        /// Limit number of pages to process
+        #[arg(long)]
+        limit: Option<usize>,
     }
 }
 
@@ -138,49 +147,63 @@ struct OpenRouterError {
 
 // --- Phases ---
 
-fn extract_pdf(input: &Path, output_dir: &Path, dpi: u16) -> Result<()> {
+fn extract_pdf(input: &Path, output_dir: &Path, dpi: u16, limit: Option<usize>) -> Result<()> {
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir).context("Failed to create output dir")?;
     }
 
-    println!("Loading PDF with MuPDF...");
-    let document = mupdf::Document::open(input.to_str().context("Invalid path")?)
+    // Open once to get count
+    println!("Loading PDF with MuPDF to check page count...");
+    let doc_check = mupdf::Document::open(input.to_str().context("Invalid path")?)
         .context("Failed to open PDF")?;
+    let total_pages = doc_check.page_count().context("Failed to get page count")? as usize;
+    
+    let num_pages = limit.map(|l| l.min(total_pages)).unwrap_or(total_pages);
+    
+    println!("Extracting {} pages (of {}) from {:?} in parallel...", num_pages, total_pages, input);
 
-    let total_pages = document.page_count().context("Failed to get page count")?;
-    println!("Extracting {} pages from {:?}...", total_pages, input);
-
-    let pb = ProgressBar::new(total_pages as u64);
+    let pb = ProgressBar::new(num_pages as u64);
     pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
         .progress_chars("#>-"));
 
-    // Scale factor for DPI (72 is the default PDF DPI)
+    // Scale factor
     let scale = dpi as f32 / 72.0;
-    let matrix = Matrix::new_scale(scale, scale);
 
-    for page_num in 0..total_pages {
+    // Process in parallel
+    // Note: mupdf::Document might not be Sync. Safer to open a fresh handle per thread or per page.
+    // Given file I/O overhead of opening is small vs rendering, we open per page or use thread local?
+    // Let's just open inside the closure. It's robust.
+    
+    (0..num_pages).into_par_iter().for_each(|page_num| {
         let filename = format!("page_{:04}.png", page_num + 1);
         let output_path = output_dir.join(&filename);
 
         if output_path.exists() {
-            // Idempotency: Skip existing files
-            pb.inc(1);
-            continue;
+             pb.inc(1);
+             return;
         }
-
-        let page = document.load_page(page_num).context("Failed to load page")?;
         
-        // Render page to pixmap with the specified DPI
-        let pixmap = page.to_pixmap(&matrix, &Colorspace::device_rgb(), false, true)
-            .context("Failed to render page")?;
+        // Open document for this thread/iteration
+        // We handle errors by printing to stderr to avoid panicking the whole parallel iterator easily, 
+        // or we could use try_for_each but that stops on first error. 
+        // Let's print error and continue others? Or panic? 
+        // User probably wants to know if it failed.
+        let process = || -> Result<()> {
+            let doc = mupdf::Document::open(input.to_str().unwrap())?;
+            let page = doc.load_page(page_num as i32)?;
+            let matrix = Matrix::new_scale(scale, scale);
+            let pixmap = page.to_pixmap(&matrix, &Colorspace::device_rgb(), false, true)?;
+            pixmap.save_as(&output_path.to_string_lossy(), mupdf::ImageFormat::PNG)?;
+            Ok(())
+        };
 
-        // Save as PNG
-        pixmap.save_as(&output_path.to_string_lossy(), mupdf::ImageFormat::PNG)
-            .context("Failed to save PNG")?;
-
+        if let Err(e) = process() {
+            eprintln!("Error processing page {}: {}", page_num + 1, e);
+        }
+        
         pb.inc(1);
-    }
+    });
     
     pb.finish_with_message("Extraction complete");
     Ok(())
@@ -262,7 +285,7 @@ async fn transcribe_images(
                     role: "user".to_string(),
                     content: vec![
                         ContentPart::Text {
-                            text: "Transcribe this page from Inside Macintosh. Output strictly formatted Markdown. Use headers, lists, and code blocks where appropriate. Do NOT wrap the entire output in a markdown block.".to_string(),
+                            text: "Transcribe this page from Inside Macintosh. Output strictly formatted Markdown. Use headers, lists, and code blocks where appropriate. IMPORTANT: Transcribe ALL legible text, including page numbers, headers, footers, and captions. Do NOT wrap the entire output in a markdown block.".to_string(),
                         },
                         ContentPart::ImageUrl {
                             image_url: ImageUrlData {
@@ -294,11 +317,23 @@ async fn transcribe_images(
                 return Err(anyhow::anyhow!("API Error: {}", err.message));
             }
 
-            let text = result.choices
+            let mut text = result.choices
                 .and_then(|c| c.into_iter().next())
                 .and_then(|c| c.message)
                 .and_then(|m| m.content)
                 .ok_or_else(|| anyhow::anyhow!("No content in response"))?;
+
+            // Clean up code blocks if the model wrapped the output
+            if text.trim_start().starts_with("```") {
+                // Find first newline
+                if let Some(newline_pos) = text.find('\n') {
+                    text = text[newline_pos + 1..].to_string();
+                }
+                // Strip trailing fence
+                if let Some(last_fence) = text.rfind("```") {
+                    text = text[..last_fence].trim_end().to_string();
+                }
+            }
 
             // Write to temp
             use std::io::Write;
@@ -347,25 +382,66 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     
     match args.command {
-        Commands::Extract { input, output, dpi } => {
-            extract_pdf(&input, &output, dpi)?;
+        Commands::Extract { input, output, dpi, limit } => {
+            let output = match output {
+                Some(p) => p,
+                None => {
+                    let book_name = input.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown_book");
+                    PathBuf::from("out").join(book_name).join("images")
+                }
+            };
+            extract_pdf(&input, &output, dpi, limit)?;
         }
         Commands::Transcribe { input, output, concurrency, model, limit } => {
             let api_key = env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY must be set")?;
             let model = model.context("Model must be specified via --model or OPENROUTER_MODEL env var")?;
+            
+            let output = match output {
+                Some(p) => p,
+                None => {
+                    // Try to deduce structure. If input is .../images, output .../markdown
+                     if input.ends_with("images") {
+                        input.parent().unwrap_or(&input).join("markdown")
+                    } else {
+                        // Fallback: out/{input_dir_name}/markdown
+                        let dir_name = input.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown_batch");
+                        PathBuf::from("out").join(dir_name).join("markdown")
+                    }
+                }
+            };
+            
             transcribe_images(input, output, concurrency, model, api_key, limit).await?;
         }
-        Commands::Pipeline { input, output, dpi, concurrency, model } => {
-            let images_dir = output.join("images");
-            let markdown_dir = output.join("markdown");
+        Commands::Pipeline { input, output, dpi, concurrency, model, limit } => {
+             let output_base = match output {
+                Some(p) => p,
+                None => {
+                     let book_name = input.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown_book");
+                     PathBuf::from("out").join(book_name)
+                }
+            };
+
+            let images_dir = output_base.join("images");
+            let markdown_dir = output_base.join("markdown");
 
             println!("--- Phase 1: Extract ---");
-            extract_pdf(&input, &images_dir, dpi)?;
+            println!("Output directory: {:?}", output_base);
+            // Limit extraction if pipeline limit is set
+            extract_pdf(&input, &images_dir, dpi, limit)?;
 
             println!("--- Phase 2: Transcribe ---");
             let api_key = env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY must be set")?;
             let model = model.context("Model must be specified via --model or OPENROUTER_MODEL env var")?;
-            transcribe_images(images_dir, markdown_dir, concurrency, model, api_key, None).await?;
+            // Transcribe also respects limit, but since we limited extraction, 
+            // the images dir will only have 'limit' images anyway. 
+            // However, if images already existed, we might want to respect limit on transcription too.
+            transcribe_images(images_dir, markdown_dir, concurrency, model, api_key, limit).await?;
         }
     }
 

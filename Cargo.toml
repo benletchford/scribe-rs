@@ -19,3 +19,4 @@ indicatif = "0.17"
 tempfile = "3.10"
 uuid = { version = "1.8", features = ["v4"] } # useful for tmp files if not using tempfile crate direct
 dotenvy = "0.15"
+rayon = "1.11.0"
