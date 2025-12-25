@@ -8,6 +8,7 @@
 - **📄 PDF to Image Extraction**: Uses `mupdf` for accurate, high-DPI rasterization.
 - **🤖 LLM Transcription**: Concurrent batch processing via OpenRouter API (supports Gemini Flash, Claude 3.5 Sonnet, etc.).
 - **📚 Smart Combination**: Merges page-level markdown into a single book, generating a Table of Contents and cleaning up artifacts.
+- **🔄 Idempotent & Resumable**: Skips already processed files, allowing you to stop and resume large jobs without losing progress.
 - **⚡ Zero-Dependency**: Statically links MuPDF for easy deployment (via `mupdf` crate).
 
 ## Installation
@@ -39,30 +40,39 @@ Alternatively, you can pass the API key and model via command-line arguments or 
 
 scribe-rs operates with subcommands. You can run the full pipeline or individual steps.
 
+> **Note**: All operations are idempotent. If an output file (image or markdown) already exists, it is skipped. This allows you to safely interrupt and resume long-running jobs.
+
 ### 1. Full Pipeline (Recommended)
 Run extraction, transcription, and combination in one go:
 ```bash
-scribe-rs pipeline --input "path/to/book.pdf" --output "out/my_book" --model "google/gemini-flash-1.5"
+cargo run --release -- pipeline --input "path/to/book.pdf" --output "out/my_book" --model "google/gemini-flash-1.5"
 ```
 
-### 2. Manual Steps
+### 2. Bulk Processing
+You can also pass a directory of PDFs to process them consecutively:
+```bash
+cargo run --release -- pipeline --input "path/to/pdf_folder" --output "out"
+```
+This will process every PDF in the folder and save the final combined Markdown files into `out/combined/`.
+
+### 3. Manual Steps
 
 **Step 1: Extract Images**
 Convert PDF pages to PNGs.
 ```bash
-scribe-rs extract --input "book.pdf" --output "out/images" --dpi 300
+cargo run --release -- extract --input "book.pdf" --output "out/images" --dpi 300
 ```
 
 **Step 2: Transcribe Images**
 Process images into Markdown files.
 ```bash
-scribe-rs transcribe --input "out/images" --output "out/markdown" --concurrency 50
+cargo run --release -- transcribe --input "out/images" --output "out/markdown" --concurrency 50
 ```
 
 **Step 3: Combine**
 Merge markdown files into a single book.
 ```bash
-scribe-rs combine --input "out/markdown" --output "final_book.md"
+cargo run --release -- combine --input "out/markdown" --output "final_book.md"
 ```
 
 ## CLI Options
