@@ -564,37 +564,79 @@ async fn main() -> Result<()> {
             combine_book(&input, &output)?;
         }
         Commands::Pipeline { input, output, dpi, concurrency, model, limit } => {
-             let output_base = match output {
-                Some(p) => p,
-                None => {
-                     let book_name = input.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown_book");
-                     PathBuf::from("out").join(book_name)
+            let inputs: Vec<PathBuf> = if input.is_dir() {
+                let mut pdfs = Vec::new();
+                let mut entries = fs::read_dir(&input).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension() {
+                            if ext.eq_ignore_ascii_case("pdf") {
+                                pdfs.push(path);
+                            }
+                        }
+                    }
                 }
+                pdfs.sort();
+                if pdfs.is_empty() {
+                    println!("No PDF files found in directory: {:?}", input);
+                } else {
+                    println!("Found {} PDF files in directory: {:?}", pdfs.len(), input);
+                }
+                pdfs
+            } else {
+                vec![input.clone()]
             };
 
-            let images_dir = output_base.join("images");
-            let markdown_dir = output_base.join("markdown");
+            for (i, pdf_path) in inputs.iter().enumerate() {
+                let book_name = pdf_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown_book");
 
-            println!("--- Phase 1: Extract ---");
-            println!("Output directory: {:?}", output_base);
-            // Limit extraction if pipeline limit is set
-            extract_pdf(&input, &images_dir, dpi, limit)?;
+                println!("\n=== Processing Book {}/{}: {} ===\n", i + 1, inputs.len(), book_name);
 
-            println!("--- Phase 2: Transcribe ---");
-            let api_key = env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY must be set")?;
-            let model = model.context("Model must be specified via --model or OPENROUTER_MODEL env var")?;
-            // Transcribe also respects limit, but since we limited extraction, 
-            // the images dir will only have 'limit' images anyway. 
-            // However, if images already existed, we might want to respect limit on transcription too.
-            transcribe_images(images_dir, markdown_dir.clone(), concurrency, model, api_key, limit).await?;
-            
-            println!("--- Phase 3: Combine ---");
-            let combined_file = output_base.join(format!("{}.md", output_base.file_name().unwrap().to_string_lossy()));
-             if let Err(e) = combine_book(&markdown_dir, &combined_file) {
-                 eprintln!("Warning: Failed to combine files: {}", e);
-             }
+                let output_base = if input.is_dir() {
+                    // If input was a directory, output arg is the parent dir for all books
+                    match &output {
+                        Some(p) => p.join(book_name),
+                        None => PathBuf::from("out").join(book_name) // Default structure
+                    }
+                } else {
+                    // Single file mode: match existing behavior
+                    match &output {
+                        Some(p) => p.clone(),
+                        None => PathBuf::from("out").join(book_name)
+                    }
+                };
+
+                let images_dir = output_base.join("images");
+                let markdown_dir = output_base.join("markdown");
+
+                println!("--- Phase 1: Extract ---");
+                println!("Output directory: {:?}", output_base);
+                
+                if let Err(e) = extract_pdf(pdf_path, &images_dir, dpi, limit) {
+                    eprintln!("Error extracting {}: {}", book_name, e);
+                    continue; // Skip to next book on failure
+                }
+
+                println!("--- Phase 2: Transcribe ---");
+                let api_key = env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY must be set")?;
+                let model_str = model.clone().context("Model must be specified via --model or OPENROUTER_MODEL env var")?;
+                
+                if let Err(e) = transcribe_images(images_dir, markdown_dir.clone(), concurrency, model_str, api_key, limit).await {
+                    eprintln!("Error transcribing {}: {}", book_name, e);
+                    continue;
+                }
+                
+                println!("--- Phase 3: Combine ---");
+                let combined_file = output_base.join(format!("{}.md", book_name));
+                 if let Err(e) = combine_book(&markdown_dir, &combined_file) {
+                     eprintln!("Warning: Failed to combine files for {}: {}", book_name, e);
+                 }
+                 
+                 println!("\nCompleted pipeline for: {}\n", book_name);
+            }
         }
     }
 
