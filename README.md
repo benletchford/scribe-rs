@@ -23,7 +23,7 @@ git clone https://github.com/benletchford/scribe-rs.git
 cd scribe-rs
 cargo build --release
 ```
-The binary will be located at `target/release/scribe-rs`.
+The binary will be located at `target/release/scribe`.
 
 ## Configuration
 
@@ -38,7 +38,7 @@ Alternatively, you can pass the API key and model via command-line arguments or 
 
 ## Usage
 
-scribe-rs operates with subcommands. You can run the full pipeline or individual steps.
+**scribe-rs** operates with subcommands. You can run the full pipeline or individual steps.
 
 > **Note**: All operations are idempotent. If an output file (image or markdown) already exists, it is skipped. This allows you to safely interrupt and resume long-running jobs.
 
