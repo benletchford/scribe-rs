@@ -630,7 +630,21 @@ async fn main() -> Result<()> {
                 }
                 
                 println!("--- Phase 3: Combine ---");
-                let combined_file = output_base.join(format!("{}.md", book_name));
+                
+                let combined_file = if input.is_dir() {
+                    let root = match &output {
+                        Some(p) => p.clone(),
+                        None => PathBuf::from("out")
+                    };
+                    let combined_dir = root.join("combined");
+                    if !combined_dir.exists() {
+                         std::fs::create_dir_all(&combined_dir).context("Failed to create combined output dir")?;
+                    }
+                    combined_dir.join(format!("{}.md", book_name))
+                } else {
+                    output_base.join(format!("{}.md", book_name))
+                };
+                
                  if let Err(e) = combine_book(&markdown_dir, &combined_file) {
                      eprintln!("Warning: Failed to combine files for {}: {}", book_name, e);
                  }
